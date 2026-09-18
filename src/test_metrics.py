@@ -772,3 +772,55 @@ def test_queue_wait_time_excludes_eta_when_events_from_other_timezone(event_expo
 
     assert get_queue_wait_sample(event_exporter, "count") == 1.0
     assert get_queue_wait_sample(event_exporter, "sum") == pytest.approx(3.0)
+
+
+def test_task_retried_carries_the_exception_class(event_exporter):
+    event_exporter.track_task_event(make_task_sent_event(QUEUE_WAIT_BASE_TIME))
+    retried = make_task_event("task-retried", QUEUE_WAIT_BASE_TIME + 1)
+    retried["exception"] = "OperationalError('server closed the connection')"
+    event_exporter.track_task_event(retried)
+
+    labels = {
+        "name": QUEUE_WAIT_TASK_NAME,
+        "hostname": "wait-test-host",
+        "queue_name": "celery",
+    }
+    assert (
+        event_exporter.registry.get_sample_value(
+            "celery_task_retried_total", {**labels, "exception": "OperationalError"}
+        )
+        == 1.0
+    )
+    # a retry is not a failure, and the zero-instantiated series has no exception
+    assert (
+        event_exporter.registry.get_sample_value(
+            "celery_task_failed_total", {**labels, "exception": ""}
+        )
+        == 0.0
+    )
+
+
+class _FakePriorityChannel:
+    sep = ":"
+    priority_steps = [0, 3, 6]
+
+    def __init__(self, lengths):
+        self.client = self
+        self._lengths = lengths
+
+    def llen(self, key):
+        return self._lengths.get(key, 0)
+
+    def _q_for_pri(self, queue, pri):
+        return f"{queue}{self.sep}{pri}" if pri else queue
+
+
+def test_redis_queue_length_sums_the_priority_shards(mocker):
+    from src.exporter import redis_queue_length
+
+    connection = mocker.Mock()
+    connection.default_channel = _FakePriorityChannel(
+        {"primary_tasks": 1, "primary_tasks:3": 40, "primary_tasks:6": 2, "other:3": 9}
+    )
+
+    assert redis_queue_length(connection, "primary_tasks") == 43

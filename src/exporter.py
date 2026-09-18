@@ -128,7 +128,13 @@ class Exporter:  # pylint: disable=too-many-instance-attributes,too-many-branche
             "task-retried": Counter(
                 f"{metric_prefix}task_retried",
                 "Sent if the task failed, but will be retried in the future.",
-                ["name", "hostname", "queue_name", *self.static_label_keys],
+                [
+                    "name",
+                    "hostname",
+                    "exception",
+                    "queue_name",
+                    *self.static_label_keys,
+                ],
                 registry=self.registry,
             ),
         }
@@ -376,7 +382,9 @@ class Exporter:  # pylint: disable=too-many-instance-attributes,too-many-branche
         for counter_name, counter in self.state_counters.items():
             _labels = labels.copy()
 
-            if counter_name == "task-failed":
+            # task-failed and task-retried events both carry the exception that
+            # caused them; every other state has none
+            if counter_name in ("task-failed", "task-retried"):
                 if counter_name == event["type"]:
                     _labels["exception"] = get_exception_class_name(task.exception)
                 else:
@@ -558,7 +566,10 @@ def reverse_adjust_timestamp(
     return ts + ((offset or 0) - here()) * 3600
 
 
-def get_exception_class_name(exception_name: str):
+def get_exception_class_name(exception_name: Optional[str]):
+    # a retry raised without an explicit exc (self.retry()) has no exception
+    if not exception_name:
+        return "UnknownException"
     m = exception_pattern.match(exception_name)
     if m:
         return m.group(1)
@@ -600,7 +611,21 @@ def transform_option_value(value: str):
 
 
 def redis_queue_length(connection, queue: str) -> int:
-    return connection.default_channel.client.llen(queue)
+    """Length of a queue on the Redis transport, across its priority shards.
+
+    Kombu's Redis transport emulates priorities with one list per priority step:
+    the highest priority lives on the bare queue name and every other step on
+    `<queue><sep><priority>`. Celery's default task priority is not the highest
+    step on most setups, so the bare list alone reads 0 while messages pile up.
+    """
+    channel = connection.default_channel
+    client = channel.client
+    steps = getattr(channel, "priority_steps", None)
+    q_for_pri = getattr(channel, "_q_for_pri", None)
+    if not steps or q_for_pri is None:
+        return client.llen(queue)
+    shards = {q_for_pri(queue, priority) for priority in steps}
+    return sum(client.llen(shard) for shard in shards)
 
 
 def rabbitmq_queue_length(connection, queue: str) -> int:
