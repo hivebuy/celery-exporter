@@ -1,0 +1,79 @@
+name: Hivebuy image
+
+# The `hivebuy` branch is upstream master plus the patches we run in production
+# (see HIVEBUY.md). Every push to it is tested and published to
+# ghcr.io/hivebuy/celery-exporter as hb-<short sha>; infrastructure pins that tag.
+# To pick up upstream changes: rebase `hivebuy` onto upstream master and push.
+
+on:
+  push:
+    branches:
+      - hivebuy
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+
+      - name: Install dependencies
+        run: poetry install --no-interaction --no-root
+
+      - name: Test (memory broker)
+        run: |
+          source .venv/bin/activate
+          pytest --broker=memory -p no:cacheprovider src
+
+  image:
+    name: Build and push
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=hb-latest
+            type=sha,enable=true,priority=100,prefix=hb-,format=short
+
+      # Fargate runs this task on x86_64; no arm64 build needed.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          provenance: false
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
