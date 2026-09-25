@@ -55,6 +55,7 @@ class Exporter:  # pylint: disable=too-many-instance-attributes,too-many-branche
         default_queue_name="celery",
         static_label=None,
         queue_wait_buckets=None,
+        defer_new_series_seconds=0,
     ):
         self.registry = CollectorRegistry(auto_describe=True)
         self.queue_cache = set(initial_queues or [])
@@ -63,6 +64,16 @@ class Exporter:  # pylint: disable=too-many-instance-attributes,too-many-branche
         # through the worker heartbeat/online/offline lifecycle, so they need their own
         # last-seen bookkeeping to be purgeable. Keyed by (metric, label values).
         self.generic_last_seen = {}
+        # A series whose first exported sample is already 1 is invisible to
+        # increase()/rate(): Prometheus has no earlier sample to diff against. Every
+        # labelled child created by an event (a task failing with a new exception, a
+        # fast task on a fresh worker) would be born that way. With a delay set, a new
+        # child is created at zero and the updates it receives in its first seconds
+        # are held back and applied on a later scrape, so the scraper sees 0 first.
+        # Keyed by (metric, label values).
+        self.defer_new_series_seconds = defer_new_series_seconds
+        self.new_series_created_at = {}
+        self.deferred_updates = {}
         self.worker_timeout_seconds = worker_timeout_seconds
         self.purge_offline_worker_metrics_after_seconds = (
             purge_offline_worker_metrics_seconds
@@ -191,6 +202,8 @@ class Exporter:  # pylint: disable=too-many-instance-attributes,too-many-branche
         )
 
     def scrape(self):
+        if self.defer_new_series_seconds > 0:
+            self.flush_deferred_updates(time.time())
         if (
             self.worker_timeout_seconds > 0
             or self.purge_offline_worker_metrics_after_seconds > 0
@@ -349,6 +362,55 @@ class Exporter:  # pylint: disable=too-many-instance-attributes,too-many-branche
                         queue_name=queue, **self.static_label
                     ).set(length)
 
+    def record(self, metric, labels, value, now, observe=False):
+        """Increment a counter (or observe a histogram) so that a brand new series is
+        exported at zero before it carries its first update."""
+        label_seq = tuple(str(labels[name]) for name in metric._labelnames)
+        if self.defer_new_series_seconds <= 0:
+            child = metric.labels(*label_seq)
+            if observe:
+                child.observe(value)
+            else:
+                child.inc(value)
+            return
+        key = (metric, label_seq)
+        if label_seq not in metric._metrics:
+            # labels() alone creates the child with every value at zero
+            metric.labels(*label_seq)
+            self.new_series_created_at[key] = now
+        if key in self.new_series_created_at:
+            if observe or value:
+                self.deferred_updates.setdefault(key, []).append((observe, value))
+            return
+        child = metric.labels(*label_seq)
+        if observe:
+            child.observe(value)
+        else:
+            child.inc(value)
+
+    def flush_deferred_updates(self, now):
+        """Apply the updates held for series that are now old enough to have been
+        scraped at zero at least once."""
+        for key, created_at in list(self.new_series_created_at.items()):
+            if now - created_at < self.defer_new_series_seconds:
+                continue
+            metric, label_seq = key
+            del self.new_series_created_at[key]
+            updates = self.deferred_updates.pop(key, [])
+            if label_seq not in metric._metrics:
+                # purged while waiting: start over, so it is exported at zero again
+                if updates:
+                    metric.labels(*label_seq)
+                    self.new_series_created_at[key] = now
+                    self.deferred_updates[key] = updates
+                continue
+            child = metric.labels(*label_seq)
+            for observe, value in updates:
+                if observe:
+                    child.observe(value)
+                else:
+                    child.inc(value)
+
     def track_task_event(self, event):
         self.state.event(event)
         task = self.state.tasks.get(event["uuid"])
@@ -391,7 +453,7 @@ class Exporter:  # pylint: disable=too-many-instance-attributes,too-many-branche
                     _labels["exception"] = ""
 
             if counter_name == event["type"]:
-                counter.labels(**_labels).inc()
+                self.record(counter, _labels, 1, now)
                 logger.debug(
                     "Incremented metric='{}' labels='{}'", counter._name, labels
                 )
@@ -399,7 +461,7 @@ class Exporter:  # pylint: disable=too-many-instance-attributes,too-many-branche
                 # instantiate unaffected counters by zero in order to make them visible
                 # task-sent is sent by various hosts (webservers, task creators)
                 # this causes label cardinality, therefore we do not want to instantiate the counter
-                counter.labels(**_labels).inc(0)
+                self.record(counter, _labels, 0, now)
             else:
                 continue
 
@@ -421,7 +483,13 @@ class Exporter:  # pylint: disable=too-many-instance-attributes,too-many-branche
                 baseline = max(baseline, eta_timestamp)
             # clock skew between producer and worker can push this negative
             queue_wait_time = max(0.0, task.started - baseline)
-            self.celery_task_queue_wait_time.labels(**labels).observe(queue_wait_time)
+            self.record(
+                self.celery_task_queue_wait_time,
+                labels,
+                queue_wait_time,
+                now,
+                observe=True,
+            )
             logger.debug(
                 "Observed metric='{}' labels='{}': {}s",
                 self.celery_task_queue_wait_time._name,
@@ -431,7 +499,9 @@ class Exporter:  # pylint: disable=too-many-instance-attributes,too-many-branche
 
         # observe task runtime
         if event["type"] == "task-succeeded":
-            self.celery_task_runtime.labels(**labels).observe(task.runtime)
+            self.record(
+                self.celery_task_runtime, labels, task.runtime, now, observe=True
+            )
             if track_generic:
                 self.track_generic_metric(self.celery_task_runtime, labels, now)
             logger.debug(

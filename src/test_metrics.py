@@ -824,3 +824,87 @@ def test_redis_queue_length_sums_the_priority_shards(mocker):
     )
 
     assert redis_queue_length(connection, "primary_tasks") == 43
+
+
+DEFER_SECONDS = 120
+FAILING_TASK = SimpleNamespace(
+    name="flaky", hostname="celery@worker-1", queue="primary", exception="SSLError('x')"
+)
+FAST_TASK = SimpleNamespace(
+    name="fast", hostname="celery@worker-1", queue="primary", runtime=0.2
+)
+FAILED_LABELS = {
+    "name": "flaky",
+    "hostname": "worker-1",
+    "queue_name": "primary",
+    "exception": "SSLError",
+}
+FAST_LABELS = {"name": "fast", "hostname": "worker-1", "queue_name": "primary"}
+
+
+def deferring_exporter(mocker):
+    exporter = Exporter(defer_new_series_seconds=DEFER_SECONDS)
+    clock = mocker.patch("src.exporter.time.time")
+    clock.return_value = 1000.0
+    return exporter, clock
+
+
+def flush_at(exporter, clock, timestamp):
+    clock.return_value = timestamp
+    exporter.flush_deferred_updates(timestamp)
+
+
+def test_new_series_are_exported_at_zero_before_their_first_update(mocker):
+    # A failure with an exception not seen before, and the first run of a fast task
+    # on a new worker, both create their series. Exported at 1 straight away, neither
+    # would be visible to increase(); held back, the scraper sees 0 first.
+    exporter, clock = deferring_exporter(mocker)
+    track_event(exporter, "task-failed", FAILING_TASK)
+    track_event(exporter, "task-received", FAST_TASK)
+    track_event(exporter, "task-succeeded", FAST_TASK)
+
+    def values():
+        sample = exporter.registry.get_sample_value
+        return (
+            sample("celery_task_failed_total", FAILED_LABELS),
+            sample("celery_task_succeeded_total", FAST_LABELS),
+            sample("celery_task_runtime_count", FAST_LABELS),
+        )
+
+    assert values() == (0.0, 0.0, 0.0)
+    flush_at(exporter, clock, 1000.0 + DEFER_SECONDS / 2)
+    assert values() == (0.0, 0.0, 0.0)
+    flush_at(exporter, clock, 1000.0 + DEFER_SECONDS)
+    assert values() == (1.0, 1.0, 1.0)
+
+
+def test_series_older_than_the_delay_are_updated_immediately(mocker):
+    exporter, clock = deferring_exporter(mocker)
+    track_event(exporter, "task-received", FAST_TASK)
+    flush_at(exporter, clock, 1000.0 + DEFER_SECONDS)
+
+    track_event(exporter, "task-succeeded", FAST_TASK)
+
+    assert (
+        exporter.registry.get_sample_value("celery_task_succeeded_total", FAST_LABELS)
+        == 1.0
+    )
+
+
+def test_series_purged_while_held_back_starts_over_at_zero(mocker):
+    exporter, clock = deferring_exporter(mocker)
+    track_event(exporter, "task-failed", FAILING_TASK)
+    exporter.state_counters["task-failed"].remove(
+        "flaky", "worker-1", "SSLError", "primary"
+    )
+
+    flush_at(exporter, clock, 1000.0 + DEFER_SECONDS)
+    assert (
+        exporter.registry.get_sample_value("celery_task_failed_total", FAILED_LABELS)
+        == 0.0
+    )
+    flush_at(exporter, clock, 1000.0 + 2 * DEFER_SECONDS)
+    assert (
+        exporter.registry.get_sample_value("celery_task_failed_total", FAILED_LABELS)
+        == 1.0
+    )

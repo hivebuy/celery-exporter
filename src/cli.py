@@ -114,6 +114,17 @@ def _eq_sign_separated_argument_to_dict(_ctx, _param, value):
     "with keeping the cardinality of the metrics low.",
 )
 @click.option(
+    "--defer-new-series",
+    default=0,
+    show_default=True,
+    type=int,
+    help="Hold a new series at zero for this many seconds before applying its "
+    "first updates. Without it, a series created by an event (a task failing with an "
+    "exception not seen before, a fast task on a new worker) is first exported with "
+    "a value of 1, and Prometheus' increase() and rate() cannot count that first "
+    "event. Set it above your scrape interval. 0 disables it.",
+)
+@click.option(
     "--generic-hostname-task-sent-metric",
     default=False,
     is_flag=True,
@@ -177,6 +188,7 @@ def cli(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too
     broker_ssl_option,
     worker_timeout,
     purge_offline_worker_metrics,
+    defer_new_series,
     generic_hostname_task_sent_metric,
     generic_hostname_worker_task_metric,
     queues,
@@ -198,4 +210,5 @@ def cli(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too
         default_queue_name,
         static_label,
         formatted_queue_wait_buckets,
+        defer_new_series,
     ).run(ctx.params)
